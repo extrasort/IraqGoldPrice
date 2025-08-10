@@ -1,11 +1,16 @@
 import logging
 import os
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+import asyncio
+import json
+from datetime import datetime
+from dotenv import load_dotenv  # <-- load env file
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Load environment variables from .env file
-from dotenv import load_dotenv
+# Load environment variables
 load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID"))
 
 # Configure logging
 logging.basicConfig(
@@ -14,167 +19,192 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configuration
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-OWNER_ID = int(os.environ.get('OWNER_ID', '0'))
-
-if not BOT_TOKEN:
-    logger.error("BOT_TOKEN not found! Please add it to your .env file")
-    exit(1)
-
-if OWNER_ID == 0:
-    logger.error("OWNER_ID not found! Please add it to your .env file")
-    exit(1)
-
-print("✅ Bot configuration loaded successfully!")
-
-# Arabic messages
+# Arabic text messages
 MESSAGES = {
     'start': """أهلاً وسهلاً! 👋
 
 هذا بوت للتواصل مع صاحب الحساب.
-يمكنك إرسال رسالتك وستصل إليه مباشرة.
+يمكنك إرسال رسالتك مباشرة وستصل إليه فوراً.
 
-اختر كيف تريد إرسال رسالتك:""",
-    
-    'choose_mode': "اختر طريقة الإرسال:",
-    'anonymous': "إرسال مجهول 🕶️",
-    'with_name': "إرسال باسمي 👤",
-    'send_message': "الآن اكتب رسالتك:",
+فقط اكتب رسالتك وأرسلها! 💬""",
     'message_sent': "تم إرسال رسالتك بنجاح! ✅",
-    'message_sent_anonymous': "تم إرسال رسالتك المجهولة بنجاح! ✅",
-    'cancel': "إلغاء ❌",
-    'cancelled': "تم إلغاء العملية.",
     'error': "حدث خطأ، يرجى المحاولة مرة أخرى.",
     'owner_only': "هذا الأمر للمالك فقط.",
     'stats_header': "📊 إحصائيات البوت:\n\n",
-    'back_to_menu': "العودة للقائمة الرئيسية 🏠"
+    'reply_sent': "تم إرسال الرد بنجاح! ✅",
+    'user_not_found': "المستخدم غير موجود أو لم يرسل رسائل من قبل.",
+    'no_conversations': "لا توجد محادثات حتى الآن.",
+    'select_user_to_reply': "اختر مستخدم للرد عليه:",
+    'owner_help': """أوامر المالك:
+/stats - عرض الإحصائيات
+/conversations - عرض قائمة المحادثات
+/broadcast - إرسال رسالة جماعية"""
 }
 
 class MessageBot:
     def __init__(self):
-        self.user_states = {}
         self.message_count = 0
-        self.anonymous_count = 0
-        self.named_count = 0
         self.users = set()
+        self.conversations = {}
+        self.user_info = {}
+        self.owner_threads = {}
+        self.load_data()
 
-    async def start_command(self, update: Update, context):
-        user_id = update.effective_user.id
-        self.users.add(user_id)
-        
-        keyboard = [
-            [KeyboardButton(MESSAGES['anonymous'])],
-            [KeyboardButton(MESSAGES['with_name'])],
-            [KeyboardButton(MESSAGES['back_to_menu'])]
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        
-        await update.message.reply_text(MESSAGES['start'], reply_markup=reply_markup)
+    def save_data(self):
+        try:
+            data = {
+                'message_count': self.message_count,
+                'users': list(self.users),
+                'conversations': self.conversations,
+                'user_info': self.user_info,
+                'owner_threads': self.owner_threads
+            }
+            with open('bot_data.json', 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving data: {e}")
 
-    async def stats_command(self, update: Update, context):
+    def load_data(self):
+        try:
+            if os.path.exists('bot_data.json'):
+                with open('bot_data.json', 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.message_count = data.get('message_count', 0)
+                    self.users = set(data.get('users', []))
+                    self.conversations = data.get('conversations', {})
+                    self.user_info = data.get('user_info', {})
+                    self.owner_threads = data.get('owner_threads', {})
+        except Exception as e:
+            logger.error(f"Error loading data: {e}")
+
+    def add_to_conversation(self, user_id: int, message: dict):
+        user_id_str = str(user_id)
+        if user_id_str not in self.conversations:
+            self.conversations[user_id_str] = []
+        self.conversations[user_id_str].append({
+            'timestamp': datetime.now().isoformat(),
+            'message': message['text'],
+            'sender': message['sender']
+        })
+        if len(self.conversations[user_id_str]) > 50:
+            self.conversations[user_id_str] = self.conversations[user_id_str][-50:]
+        self.save_data()
+
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        self.users.add(user.id)
+        self.user_info[str(user.id)] = {
+            'first_name': user.first_name,
+            'last_name': user.last_name,
+            'username': user.username,
+            'last_active': datetime.now().isoformat()
+        }
+        self.save_data()
+        await update.message.reply_text(MESSAGES['start'])
+
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id == OWNER_ID:
+            await update.message.reply_text(MESSAGES['owner_help'])
+        else:
+            await self.start_command(update, context)
+
+    async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_user.id != OWNER_ID:
             await update.message.reply_text(MESSAGES['owner_only'])
             return
-        
         stats_text = MESSAGES['stats_header']
         stats_text += f"عدد المستخدمين: {len(self.users)}\n"
         stats_text += f"إجمالي الرسائل: {self.message_count}\n"
-        stats_text += f"الرسائل المجهولة: {self.anonymous_count}\n"
-        stats_text += f"الرسائل المعرّفة: {self.named_count}\n"
-        
+        stats_text += f"المحادثات النشطة: {len(self.conversations)}\n"
         await update.message.reply_text(stats_text)
 
-    async def handle_message(self, update: Update, context):
+    async def conversations_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != OWNER_ID:
+            await update.message.reply_text(MESSAGES['owner_only'])
+            return
+        if not self.conversations:
+            await update.message.reply_text(MESSAGES['no_conversations'])
+            return
+        keyboard = []
+        for user_id, messages in self.conversations.items():
+            info = self.user_info.get(user_id, {})
+            name = info.get('first_name', f'مستخدم {user_id}')
+            if info.get('last_name'):
+                name += f" {info['last_name']}"
+            last_message = messages[-1]['message'] if messages else ""
+            preview = (last_message[:30] + "...") if len(last_message) > 30 else last_message
+            keyboard.append([InlineKeyboardButton(f"👤 {name} - {preview}", callback_data=f"reply_{user_id}")])
+        await update.message.reply_text(MESSAGES['select_user_to_reply'], reply_markup=InlineKeyboardMarkup(keyboard))
+
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
-        message_text = update.message.text
-        
+        text = update.message.text
+        if user_id == OWNER_ID:
+            await self.handle_owner_message(update, context)
+            return
         self.users.add(user_id)
-        
-        if message_text == MESSAGES['anonymous']:
-            self.user_states[user_id] = 'waiting_anonymous_message'
-            keyboard = [[KeyboardButton(MESSAGES['cancel'])]]
-            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-            await update.message.reply_text(MESSAGES['send_message'], reply_markup=reply_markup)
-            
-        elif message_text == MESSAGES['with_name']:
-            self.user_states[user_id] = 'waiting_named_message'
-            keyboard = [[KeyboardButton(MESSAGES['cancel'])]]
-            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-            await update.message.reply_text(MESSAGES['send_message'], reply_markup=reply_markup)
-            
-        elif message_text == MESSAGES['cancel']:
-            if user_id in self.user_states:
-                del self.user_states[user_id]
-            await self.show_main_menu(update)
-            await update.message.reply_text(MESSAGES['cancelled'])
-            
-        elif message_text == MESSAGES['back_to_menu']:
-            if user_id in self.user_states:
-                del self.user_states[user_id]
-            await self.show_main_menu(update)
-            
-        elif user_id in self.user_states:
-            state = self.user_states[user_id]
-            
-            if state == 'waiting_anonymous_message':
-                await self.send_to_owner(update, message_text, anonymous=True)
-                self.anonymous_count += 1
-                self.message_count += 1
-                del self.user_states[user_id]
-                await self.show_main_menu(update)
-                await update.message.reply_text(MESSAGES['message_sent_anonymous'])
-                
-            elif state == 'waiting_named_message':
-                await self.send_to_owner(update, message_text, anonymous=False)
-                self.named_count += 1
-                self.message_count += 1
-                del self.user_states[user_id]
-                await self.show_main_menu(update)
-                await update.message.reply_text(MESSAGES['message_sent'])
-        else:
-            await self.show_main_menu(update)
+        user = update.effective_user
+        self.user_info[str(user_id)] = {
+            'first_name': user.first_name,
+            'last_name': user.last_name,
+            'username': user.username,
+            'last_active': datetime.now().isoformat()
+        }
+        self.message_count += 1
+        await self.send_to_owner(update, text)
+        await update.message.reply_text(MESSAGES['message_sent'])
 
-    async def show_main_menu(self, update: Update):
-        keyboard = [
-            [KeyboardButton(MESSAGES['anonymous'])],
-            [KeyboardButton(MESSAGES['with_name'])]
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        await update.message.reply_text(MESSAGES['choose_mode'], reply_markup=reply_markup)
+    async def handle_owner_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.message.reply_to_message:
+            for uid, mid in self.owner_threads.items():
+                if update.message.reply_to_message.message_id == mid:
+                    await self.send_reply_to_user(update, int(uid), update.message.text)
+                    return
+        await update.message.reply_text("الرجاء الرد على رسالة المستخدم في سلسلة المحادثة.")
 
-    async def send_to_owner(self, update: Update, message_text: str, anonymous: bool = True):
+    async def send_reply_to_user(self, update: Update, target_user_id: int, message_text: str):
+        try:
+            await update.get_bot().send_message(chat_id=target_user_id, text=message_text)
+            self.add_to_conversation(target_user_id, {'text': message_text, 'sender': 'owner'})
+            await update.message.reply_text(MESSAGES['reply_sent'])
+        except Exception as e:
+            logger.error(f"Error sending reply: {e}")
+            await update.message.reply_text(MESSAGES['error'])
+
+    async def send_to_owner(self, update: Update, message_text: str):
         try:
             user = update.effective_user
-            
-            if anonymous:
-                forward_text = f"📩 رسالة مجهولة جديدة:\n\n{message_text}"
-            else:
-                username = f"@{user.username}" if user.username else "لا يوجد معرف"
-                forward_text = f"📨 رسالة جديدة من:\n"
-                forward_text += f"الاسم: {user.first_name}"
-                if user.last_name:
-                    forward_text += f" {user.last_name}"
-                forward_text += f"\nالمعرف: {username}\n"
-                forward_text += f"الID: {user.id}\n\n"
-                forward_text += f"الرسالة:\n{message_text}"
-            
-            await update.get_bot().send_message(chat_id=OWNER_ID, text=forward_text)
-            
+            user_id = user.id
+            username = f"@{user.username}" if user.username else "لا يوجد معرف"
+            header_text = f"📨 محادثة مع {user.first_name or ''} {user.last_name or ''}\n🆔 {username} | ID: {user.id}"
+            if str(user_id) not in self.owner_threads:
+                msg = await update.get_bot().send_message(chat_id=OWNER_ID, text=header_text)
+                self.owner_threads[str(user_id)] = msg.message_id
+                self.save_data()
+            await update.get_bot().send_message(
+                chat_id=OWNER_ID,
+                text=message_text,
+                reply_to_message_id=self.owner_threads[str(user_id)]
+            )
+            self.add_to_conversation(user_id, {'text': message_text, 'sender': 'user'})
         except Exception as e:
-            logger.error(f"Error sending message to owner: {e}")
+            logger.error(f"Error sending to owner: {e}")
             await update.message.reply_text(MESSAGES['error'])
+
+    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.error(f"Update {update} caused error {context.error}")
 
 def main():
     bot = MessageBot()
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    application.add_handler(CommandHandler("start", bot.start_command))
-    application.add_handler(CommandHandler("stats", bot.stats_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
-    
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", bot.start_command))
+    app.add_handler(CommandHandler("help", bot.help_command))
+    app.add_handler(CommandHandler("stats", bot.stats_command))
+    app.add_handler(CommandHandler("conversations", bot.conversations_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
+    app.add_error_handler(bot.error_handler)
     print("🤖 البوت يعمل الآن...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

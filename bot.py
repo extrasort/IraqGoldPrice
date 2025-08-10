@@ -1,9 +1,8 @@
 import logging
 import os
-import asyncio
 import json
 from datetime import datetime
-from dotenv import load_dotenv  # <-- load env file
+from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -19,7 +18,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Arabic text messages
+# Arabic messages
 MESSAGES = {
     'start': """أهلاً وسهلاً! 👋
 
@@ -27,18 +26,15 @@ MESSAGES = {
 يمكنك إرسال رسالتك مباشرة وستصل إليه فوراً.
 
 فقط اكتب رسالتك وأرسلها! 💬""",
-    'message_sent': "تم إرسال رسالتك بنجاح! ✅",
     'error': "حدث خطأ، يرجى المحاولة مرة أخرى.",
     'owner_only': "هذا الأمر للمالك فقط.",
     'stats_header': "📊 إحصائيات البوت:\n\n",
-    'reply_sent': "تم إرسال الرد بنجاح! ✅",
     'user_not_found': "المستخدم غير موجود أو لم يرسل رسائل من قبل.",
     'no_conversations': "لا توجد محادثات حتى الآن.",
     'select_user_to_reply': "اختر مستخدم للرد عليه:",
     'owner_help': """أوامر المالك:
 /stats - عرض الإحصائيات
-/conversations - عرض قائمة المحادثات
-/broadcast - إرسال رسالة جماعية"""
+/conversations - عرض قائمة المحادثات"""
 }
 
 class MessageBot:
@@ -52,15 +48,14 @@ class MessageBot:
 
     def save_data(self):
         try:
-            data = {
-                'message_count': self.message_count,
-                'users': list(self.users),
-                'conversations': self.conversations,
-                'user_info': self.user_info,
-                'owner_threads': self.owner_threads
-            }
             with open('bot_data.json', 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+                json.dump({
+                    'message_count': self.message_count,
+                    'users': list(self.users),
+                    'conversations': self.conversations,
+                    'user_info': self.user_info,
+                    'owner_threads': self.owner_threads
+                }, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.error(f"Error saving data: {e}")
 
@@ -83,11 +78,10 @@ class MessageBot:
             self.conversations[user_id_str] = []
         self.conversations[user_id_str].append({
             'timestamp': datetime.now().isoformat(),
-            'message': message['text'],
-            'sender': message['sender']
+            **message
         })
-        if len(self.conversations[user_id_str]) > 50:
-            self.conversations[user_id_str] = self.conversations[user_id_str][-50:]
+        if len(self.conversations[user_id_str]) > 100:
+            self.conversations[user_id_str] = self.conversations[user_id_str][-100:]
         self.save_data()
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -131,7 +125,7 @@ class MessageBot:
             name = info.get('first_name', f'مستخدم {user_id}')
             if info.get('last_name'):
                 name += f" {info['last_name']}"
-            last_message = messages[-1]['message'] if messages else ""
+            last_message = messages[-1]['text'] if messages else ""
             preview = (last_message[:30] + "...") if len(last_message) > 30 else last_message
             keyboard.append([InlineKeyboardButton(f"👤 {name} - {preview}", callback_data=f"reply_{user_id}")])
         await update.message.reply_text(MESSAGES['select_user_to_reply'], reply_markup=InlineKeyboardMarkup(keyboard))
@@ -139,9 +133,11 @@ class MessageBot:
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         text = update.message.text
+
         if user_id == OWNER_ID:
             await self.handle_owner_message(update, context)
             return
+
         self.users.add(user_id)
         user = update.effective_user
         self.user_info[str(user_id)] = {
@@ -151,45 +147,75 @@ class MessageBot:
             'last_active': datetime.now().isoformat()
         }
         self.message_count += 1
-        await self.send_to_owner(update, text)
-        await update.message.reply_text(MESSAGES['message_sent'])
+
+        # Store the message
+        self.add_to_conversation(user_id, {
+            'text': text,
+            'sender': 'user',
+            'tg_message_id': update.message.message_id
+        })
+
+        await self.send_to_owner(update, text, update.message.message_id)
 
     async def handle_owner_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message.reply_to_message:
-            for uid, mid in self.owner_threads.items():
-                if update.message.reply_to_message.message_id == mid:
-                    await self.send_reply_to_user(update, int(uid), update.message.text)
-                    return
-        await update.message.reply_text("الرجاء الرد على رسالة المستخدم في سلسلة المحادثة.")
+            replied_id = update.message.reply_to_message.message_id
+            # Find the user this message belongs to
+            for uid, messages in self.conversations.items():
+                for msg in messages:
+                    if msg.get('tg_owner_message_id') == replied_id:
+                        await self.send_reply_to_user(
+                            update,
+                            int(uid),
+                            update.message.text,
+                            reply_to_msg_id=msg.get('tg_message_id')
+                        )
+                        return
+        await update.message.reply_text("❗ يجب الرد على رسالة مستخدم موجودة.")
 
-    async def send_reply_to_user(self, update: Update, target_user_id: int, message_text: str):
+    async def send_reply_to_user(self, update: Update, target_user_id: int, message_text: str, reply_to_msg_id=None):
         try:
-            await update.get_bot().send_message(chat_id=target_user_id, text=message_text)
-            self.add_to_conversation(target_user_id, {'text': message_text, 'sender': 'owner'})
-            await update.message.reply_text(MESSAGES['reply_sent'])
+            sent_msg = await update.get_bot().send_message(
+                chat_id=target_user_id,
+                text=message_text,
+                reply_to_message_id=reply_to_msg_id
+            )
+            self.add_to_conversation(target_user_id, {
+                'text': message_text,
+                'sender': 'owner',
+                'tg_message_id': sent_msg.message_id
+            })
         except Exception as e:
             logger.error(f"Error sending reply: {e}")
             await update.message.reply_text(MESSAGES['error'])
 
-    async def send_to_owner(self, update: Update, message_text: str):
+    async def send_to_owner(self, update: Update, message_text: str, user_msg_id: int):
         try:
             user = update.effective_user
             user_id = user.id
             username = f"@{user.username}" if user.username else "لا يوجد معرف"
             header_text = f"📨 محادثة مع {user.first_name or ''} {user.last_name or ''}\n🆔 {username} | ID: {user.id}"
+
             if str(user_id) not in self.owner_threads:
                 msg = await update.get_bot().send_message(chat_id=OWNER_ID, text=header_text)
                 self.owner_threads[str(user_id)] = msg.message_id
                 self.save_data()
-            await update.get_bot().send_message(
+
+            owner_msg = await update.get_bot().send_message(
                 chat_id=OWNER_ID,
                 text=message_text,
                 reply_to_message_id=self.owner_threads[str(user_id)]
             )
-            self.add_to_conversation(user_id, {'text': message_text, 'sender': 'user'})
+
+            self.add_to_conversation(user_id, {
+                'text': message_text,
+                'sender': 'user',
+                'tg_message_id': user_msg_id,
+                'tg_owner_message_id': owner_msg.message_id
+            })
+
         except Exception as e:
             logger.error(f"Error sending to owner: {e}")
-            await update.message.reply_text(MESSAGES['error'])
 
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Update {update} caused error {context.error}")

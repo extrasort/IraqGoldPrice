@@ -23,13 +23,12 @@ MESSAGES = {
     'start': """أهلاً وسهلاً! 👋
 
 هذا بوت للتواصل مع صاحب الحساب.
-يمكنك إرسال رسالتك مباشرة وستصل إليه فوراً.
+يمكنك إرسال رسالتك أو صورتك مباشرة وستصل إليه فوراً.
 
-فقط اكتب رسالتك وأرسلها! 💬""",
+فقط اكتب رسالتك أو أرسل صورتك! 💬📷""",
     'error': "حدث خطأ، يرجى المحاولة مرة أخرى.",
     'owner_only': "هذا الأمر للمالك فقط.",
     'stats_header': "📊 إحصائيات البوت:\n\n",
-    'user_not_found': "المستخدم غير موجود أو لم يرسل رسائل من قبل.",
     'no_conversations': "لا توجد محادثات حتى الآن.",
     'select_user_to_reply': "اختر مستخدم للرد عليه:",
     'owner_help': """أوامر المالك:
@@ -125,14 +124,18 @@ class MessageBot:
             name = info.get('first_name', f'مستخدم {user_id}')
             if info.get('last_name'):
                 name += f" {info['last_name']}"
-            last_message = messages[-1]['text'] if messages else ""
+            last_message = ""
+            if messages[-1].get('text'):
+                last_message = messages[-1]['text']
+            elif messages[-1].get('photo'):
+                last_message = "[📷 صورة]"
             preview = (last_message[:30] + "...") if len(last_message) > 30 else last_message
             keyboard.append([InlineKeyboardButton(f"👤 {name} - {preview}", callback_data=f"reply_{user_id}")])
         await update.message.reply_text(MESSAGES['select_user_to_reply'], reply_markup=InlineKeyboardMarkup(keyboard))
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
-        text = update.message.text
+        message = update.message
 
         if user_id == OWNER_ID:
             await self.handle_owner_message(update, context)
@@ -148,28 +151,48 @@ class MessageBot:
         }
         self.message_count += 1
 
-        # Store the message
-        self.add_to_conversation(user_id, {
-            'text': text,
-            'sender': 'user',
-            'tg_message_id': update.message.message_id
-        })
+        if message.text:
+            msg_data = {
+                'text': message.text,
+                'sender': 'user',
+                'tg_message_id': message.message_id
+            }
+            self.add_to_conversation(user_id, msg_data)
+            await self.send_to_owner(update, message.text, message.message_id)
 
-        await self.send_to_owner(update, text, update.message.message_id)
+        elif message.photo:
+            file_id = message.photo[-1].file_id
+            msg_data = {
+                'photo': file_id,
+                'caption': message.caption,
+                'sender': 'user',
+                'tg_message_id': message.message_id
+            }
+            self.add_to_conversation(user_id, msg_data)
+            await self.send_photo_to_owner(update, file_id, message.caption, message.message_id)
 
     async def handle_owner_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message.reply_to_message:
             replied_id = update.message.reply_to_message.message_id
-            # Find the user this message belongs to
             for uid, messages in self.conversations.items():
                 for msg in messages:
                     if msg.get('tg_owner_message_id') == replied_id:
-                        await self.send_reply_to_user(
-                            update,
-                            int(uid),
-                            update.message.text,
-                            reply_to_msg_id=msg.get('tg_message_id')
-                        )
+                        if update.message.text:
+                            await self.send_reply_to_user(
+                                update,
+                                int(uid),
+                                update.message.text,
+                                reply_to_msg_id=msg.get('tg_message_id')
+                            )
+                        elif update.message.photo:
+                            file_id = update.message.photo[-1].file_id
+                            await self.send_photo_reply_to_user(
+                                update,
+                                int(uid),
+                                file_id,
+                                update.message.caption,
+                                reply_to_msg_id=msg.get('tg_message_id')
+                            )
                         return
         await update.message.reply_text("❗ يجب الرد على رسالة مستخدم موجودة.")
 
@@ -187,6 +210,24 @@ class MessageBot:
             })
         except Exception as e:
             logger.error(f"Error sending reply: {e}")
+            await update.message.reply_text(MESSAGES['error'])
+
+    async def send_photo_reply_to_user(self, update: Update, target_user_id: int, file_id: str, caption: str, reply_to_msg_id=None):
+        try:
+            sent_msg = await update.get_bot().send_photo(
+                chat_id=target_user_id,
+                photo=file_id,
+                caption=caption or "",
+                reply_to_message_id=reply_to_msg_id
+            )
+            self.add_to_conversation(target_user_id, {
+                'photo': file_id,
+                'caption': caption,
+                'sender': 'owner',
+                'tg_message_id': sent_msg.message_id
+            })
+        except Exception as e:
+            logger.error(f"Error sending photo reply: {e}")
             await update.message.reply_text(MESSAGES['error'])
 
     async def send_to_owner(self, update: Update, message_text: str, user_msg_id: int):
@@ -217,6 +258,36 @@ class MessageBot:
         except Exception as e:
             logger.error(f"Error sending to owner: {e}")
 
+    async def send_photo_to_owner(self, update: Update, file_id: str, caption: str, user_msg_id: int):
+        try:
+            user = update.effective_user
+            user_id = user.id
+            username = f"@{user.username}" if user.username else "لا يوجد معرف"
+            header_text = f"📨 محادثة مع {user.first_name or ''} {user.last_name or ''}\n🆔 {username} | ID: {user.id}"
+
+            if str(user_id) not in self.owner_threads:
+                msg = await update.get_bot().send_message(chat_id=OWNER_ID, text=header_text)
+                self.owner_threads[str(user_id)] = msg.message_id
+                self.save_data()
+
+            owner_msg = await update.get_bot().send_photo(
+                chat_id=OWNER_ID,
+                photo=file_id,
+                caption=caption or "",
+                reply_to_message_id=self.owner_threads[str(user_id)]
+            )
+
+            self.add_to_conversation(user_id, {
+                'photo': file_id,
+                'caption': caption,
+                'sender': 'user',
+                'tg_message_id': user_msg_id,
+                'tg_owner_message_id': owner_msg.message_id
+            })
+
+        except Exception as e:
+            logger.error(f"Error sending photo to owner: {e}")
+
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Update {update} caused error {context.error}")
 
@@ -227,7 +298,7 @@ def main():
     app.add_handler(CommandHandler("help", bot.help_command))
     app.add_handler(CommandHandler("stats", bot.stats_command))
     app.add_handler(CommandHandler("conversations", bot.conversations_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
+    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, bot.handle_message))
     app.add_error_handler(bot.error_handler)
     print("🤖 البوت يعمل الآن...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
